@@ -1,20 +1,15 @@
 # SLURM Job Management Notes
 
-## Default Partition
-
-**Always use `ailab` partition by default.** Only use other partitions (pli, gpu) when the user explicitly requests them.
-
 ## Session Termination Policy
 
 **DO NOT automatically scancel sessions after srun commands finish!**
 
 - Keep the session alive after srun completes - user may want to run more commands
 - Only use `scancel` when user explicitly asks to cancel/end/terminate the session
-- Start keep_it_on.py during idle periods to maintain GPU utilization
 
 ## Using srun Instead of sbatch
 
-**User preference: Use `srun` for testing, not `sbatch`**
+**For testing/development: Use `srun` for interactive testing**
 
 ### salloc + srun Workflow
 
@@ -31,9 +26,9 @@ salloc --nodes=1 --ntasks=1 --gres=gpu:1 --time=00:30:00 srun --export=ALL comma
 
 ### Key Requirements for Compute Nodes
 
-#### 1. No Internet Access on Compute Nodes
-- Compute nodes cannot reach external sites (huggingface.co, etc.)
-- **MUST pre-download all models/data on login node BEFORE running jobs**
+#### 1. Network Access on Compute Nodes
+- Compute nodes may not have internet access (cluster-dependent)
+- **Check your cluster's policy - you may need to pre-download models/data on login node**
 
 #### 2. Pre-downloading Models for Offline Use
 
@@ -51,7 +46,7 @@ path = snapshot_download(
 
 #### 3. Environment Variables for Offline Mode
 
-Must export these before running srun:
+Must export these before running srun (if no internet on compute nodes):
 ```bash
 export HF_HOME=/path/to/.cache/huggingface
 export TRANSFORMERS_CACHE=/path/to/.cache/huggingface
@@ -63,10 +58,10 @@ export TRANSFORMERS_OFFLINE=1
 
 **IMPORTANT:** Must use the full snapshot path, not repo ID:
 ```bash
-# ❌ This won't work on compute node (tries to access internet):
+# This may not work on compute node (tries to access internet):
 --model "facebook/opt-125m"
 
-# ✅ This works (uses local cache):
+# This works (uses local cache):
 --model "/path/.cache/huggingface/models--facebook--opt-125m/snapshots/<hash>"
 ```
 
@@ -85,7 +80,7 @@ srun --export=ALL command
 export HF_HOME=/path/to/.cache/huggingface
 export TRANSFORMERS_CACHE=/path/to/.cache/huggingface
 
-# 2. Enable offline mode
+# 2. Enable offline mode (if no internet on compute nodes)
 export HF_DATASETS_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 
@@ -105,7 +100,7 @@ salloc --nodes=1 --ntasks=1 --gres=gpu:1 --time=00:30:00 \
 - `--gres=gpu:1` - Request 1 GPU
 - `--gres=gpu:2` - Request 2 GPUs
 - `--time=00:30:00` - Time limit (HH:MM:SS)
-- `--partition=gpu` - Specific partition (if needed)
+- `--partition=<name>` - Specific partition (if needed)
 
 ## Troubleshooting
 
@@ -120,22 +115,3 @@ salloc --nodes=1 --ntasks=1 --gres=gpu:1 --time=00:30:00 \
 ### Error: Environment variables not set
 - **Cause:** Forgot `--export=ALL` with srun
 - **Solution:** Add `--export=ALL` to srun command
-
-## vLLM Specific Notes
-
-### Benchmarking Setup
-- Load time includes model initialization + CUDA graph compilation
-- Small models (125M params): ~24 seconds load time
-- Generation is very fast once loaded (~3000+ tokens/sec for small models)
-
-### Memory Considerations
-- vLLM shows "Available KV cache memory" during startup
-- Watch for "Maximum concurrency" metric for batching capacity
-
-## Workflow Tested
-
-✅ Successfully tested with:
-- Model: facebook/opt-125m
-- Setup: salloc + srun
-- GPU node: della-l03g15, della-l04g15
-- Result: 3,275 tokens/second throughput
