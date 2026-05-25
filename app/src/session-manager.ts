@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { Session, ChannelSession, OAuthToken, UserSettings } from './types.js';
+import { Session, ChannelSession, OAuthToken, UserSettings, AgentType } from './types.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -123,15 +123,35 @@ export class SessionManager {
       return false;
     }
 
+    const existing = this.userSettings.get(userId);
     const settings: UserSettings = {
       userId,
       selectedTokenAlias: alias,
+      defaultAgent: existing?.defaultAgent,
       updatedAt: new Date(),
     };
     this.userSettings.set(userId, settings);
     this.saveUserSettings();
     console.log(`[UserSettings] User ${userId} selected token alias: ${alias}`);
     return true;
+  }
+
+  // Set the user's preferred default agent type for new channels
+  setUserDefaultAgent(userId: string, agentType: AgentType): void {
+    const existing = this.userSettings.get(userId);
+    const settings: UserSettings = {
+      userId,
+      selectedTokenAlias: existing?.selectedTokenAlias || '',
+      defaultAgent: agentType,
+      updatedAt: new Date(),
+    };
+    this.userSettings.set(userId, settings);
+    this.saveUserSettings();
+    console.log(`[UserSettings] User ${userId} default agent: ${agentType}`);
+  }
+
+  getUserDefaultAgent(userId: string): AgentType | undefined {
+    return this.userSettings.get(userId)?.defaultAgent;
   }
 
   // Get user settings
@@ -181,7 +201,8 @@ export class SessionManager {
     channelId: string,
     sessionToken: string,
     userId: string,
-    terminalId: string
+    terminalId: string,
+    agentType: AgentType = 'claude'
   ): ChannelSession {
     const mcpPort = this.nextMcpPort++;
     const channelSession: ChannelSession = {
@@ -190,6 +211,7 @@ export class SessionManager {
       userId,
       terminalId,
       mcpPort,
+      agentType,
       createdAt: new Date(),
     };
     this.channelSessions.set(channelId, channelSession);
@@ -204,6 +226,18 @@ export class SessionManager {
   removeChannelSession(channelId: string): void {
     this.channelSessions.delete(channelId);
     this.saveSessions();
+  }
+
+  updateChannelSessionTerminal(channelId: string, terminalId: string, mcpPort?: number): ChannelSession | undefined {
+    const session = this.channelSessions.get(channelId);
+    if (!session) return undefined;
+    session.terminalId = terminalId;
+    if (mcpPort !== undefined) {
+      session.mcpPort = mcpPort;
+    }
+    this.channelSessions.set(channelId, session);
+    this.saveSessions();
+    return session;
   }
 
   getAllChannelSessions(): ChannelSession[] {

@@ -1,3 +1,6 @@
+import { AgentType } from './agents/index.js';
+export { AgentType };
+
 export interface Session {
   token: string;
   userId: string;
@@ -17,6 +20,7 @@ export interface OAuthToken {
 export interface UserSettings {
   userId: string;
   selectedTokenAlias: string;  // Which token alias the user has selected
+  defaultAgent?: AgentType;    // Preferred agent type for new channels
   updatedAt: Date;
 }
 
@@ -26,6 +30,7 @@ export interface ChannelSession {
   userId: string;
   terminalId: string;
   mcpPort: number;
+  agentType: AgentType;
   createdAt: Date;
 }
 
@@ -45,4 +50,5 @@ export interface MCPMessage {
   fileContent?: string;
   mentionUser?: boolean;
   mentionText?: string;
+  thread_ts?: string;  // If set, message is sent as a reply in this thread
 }

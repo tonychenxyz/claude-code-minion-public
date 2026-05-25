@@ -2,7 +2,7 @@ import pkg from '@slack/bolt';
 const { App, LogLevel } = pkg;
 import { SessionManager } from './session-manager.js';
 import { TerminalManager } from './terminal-manager.js';
-import { OAuthToken } from './types.js';
+import { OAuthToken, AgentType } from './types.js';
 import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
@@ -13,6 +13,7 @@ interface PendingMessage {
   text: string;
   timestamp: Date;
   files?: string[]; // Paths to downloaded files
+  thread_ts?: string; // Thread timestamp if message is in a thread
 }
 
 // Retry configuration for Slack API calls
@@ -126,9 +127,12 @@ export class SlackBot {
       }
 
       // Channel message - forward to Claude Code
+      // Extract thread_ts if the message is a reply in a thread
+      const thread_ts = (message as any).thread_ts as string | undefined;
+
       // Process any attached files
       const downloadedFiles = await this.processMessageFiles(message, channelId);
-      await this.handleChannelMessage(channelId, userId, text, client, downloadedFiles);
+      await this.handleChannelMessage(channelId, userId, text, client, downloadedFiles, thread_ts);
     });
 
     // Handle bot being added to a channel
@@ -173,9 +177,12 @@ export class SlackBot {
       if (!userId) return;
       const text = event.text.replace(/<@[A-Z0-9]+>/gi, '').trim();
 
+      // Extract thread_ts if the mention is in a thread
+      const thread_ts = (event as any).thread_ts as string | undefined;
+
       // Process any attached files
       const downloadedFiles = await this.processMessageFiles(event, channelId);
-      await this.handleChannelMessage(channelId, userId, text, client, downloadedFiles);
+      await this.handleChannelMessage(channelId, userId, text, client, downloadedFiles, thread_ts);
     });
 
     // Slash command: /reset - Start a fresh conversation
@@ -194,13 +201,14 @@ export class SlackBot {
 
       this.terminalManager.resetConversation(channelId);
       this.messageQueues.set(channelId, []);
+      const agentLabel = channelSession.agentType === 'codex' ? 'Codex' : 'Claude Code';
       await respond({
-        text: `🔄 Conversation reset. Next message will start a new Claude Code session.`,
+        text: `🔄 Conversation reset. Next message will start a new ${agentLabel} session.`,
         response_type: 'in_channel',
       });
     });
 
-    // Slash command: /interrupt - Stop current Claude operation
+    // Slash command: /interrupt - Stop current agent operation
     this.app.command('/interrupt', async ({ command, ack, respond }) => {
       await ack();
       const channelId = command.channel_id;
@@ -219,8 +227,9 @@ export class SlackBot {
       this.messageQueues.set(channelId, []);
 
       if (success) {
+        const agentLabel = channelSession.agentType === 'codex' ? 'Codex' : 'Claude Code';
         await respond({
-          text: `⏹️ Interrupted Claude Code (sent Ctrl+C) and cleared message queue`,
+          text: `⏹️ Interrupted ${agentLabel} (sent Ctrl+C). Waiting for shell to be ready — your next message will be queued and sent automatically.`,
           response_type: 'in_channel',
         });
       } else {
@@ -231,7 +240,7 @@ export class SlackBot {
       }
     });
 
-    // Slash command: /compact - Trigger Claude Code's /compact command
+    // Slash command: /compact - Trigger Claude Code's /compact command (claude only)
     this.app.command('/compact', async ({ command, ack, respond }) => {
       await ack();
       const channelId = command.channel_id;
@@ -240,7 +249,15 @@ export class SlackBot {
 
       if (!channelSession) {
         await respond({
-          text: `No active Claude Code session in this channel. Send a message first to start one.`,
+          text: `No active session in this channel. Send a message first to start one.`,
+          response_type: 'ephemeral',
+        });
+        return;
+      }
+
+      if (channelSession.agentType === 'codex') {
+        await respond({
+          text: `📦 \`/compact\` is Claude Code only. Use \`/reset\` to start a fresh Codex conversation.`,
           response_type: 'ephemeral',
         });
         return;
@@ -277,20 +294,39 @@ export class SlackBot {
         return;
       }
 
+      const channelSession = this.sessionManager.getChannelSession(channelId);
+      const agentType = channelSession?.agentType || 'claude';
       const usageText = JSON.stringify(usage, null, 2);
-      const totalContext = (usage.input_tokens || 0) +
-        (usage.cache_creation_input_tokens || 0) +
-        (usage.cache_read_input_tokens || 0);
       const contextMax = parseInt(process.env.CONTEXT_WINDOW_MAX || '200000', 10);
-      const percentage = ((totalContext / contextMax) * 100).toFixed(1);
 
-      await respond({
-        text: `📊 *Context Usage Stats:*\n\`\`\`\n${usageText}\n\`\`\`\n\n` +
-          `*Breakdown:*\n` +
+      let breakdown: string;
+      let totalContext: number;
+
+      if (agentType === 'codex') {
+        // Codex schema: input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens
+        totalContext = (usage.input_tokens || 0) + (usage.cached_input_tokens || 0);
+        breakdown =
+          `• Input tokens (new): ${usage.input_tokens || 0}\n` +
+          `• Cached input: ${usage.cached_input_tokens || 0}\n` +
+          `• Output tokens: ${usage.output_tokens || 0}\n` +
+          `• Reasoning tokens: ${usage.reasoning_output_tokens || 0}`;
+      } else {
+        // Claude schema: input_tokens, cache_creation_input_tokens, cache_read_input_tokens, output_tokens
+        totalContext = (usage.input_tokens || 0) +
+          (usage.cache_creation_input_tokens || 0) +
+          (usage.cache_read_input_tokens || 0);
+        breakdown =
           `• Input tokens (new): ${usage.input_tokens || 0}\n` +
           `• Cache creation: ${usage.cache_creation_input_tokens || 0}\n` +
           `• Cache read: ${usage.cache_read_input_tokens || 0}\n` +
-          `• Output tokens: ${usage.output_tokens || 0}\n\n` +
+          `• Output tokens: ${usage.output_tokens || 0}`;
+      }
+
+      const percentage = ((totalContext / contextMax) * 100).toFixed(1);
+
+      await respond({
+        text: `📊 *Context Usage Stats* (\`${agentType}\`):\n\`\`\`\n${usageText}\n\`\`\`\n\n` +
+          `*Breakdown:*\n${breakdown}\n\n` +
           `*Total context:* ${totalContext.toLocaleString()} / ${contextMax.toLocaleString()} tokens (*${percentage}%*)`,
         response_type: 'in_channel',
       });
@@ -317,6 +353,68 @@ export class SlackBot {
         text: `📟 *Terminal output (last 30 chunks):*\n\`\`\`\n${outputText || '(no output)'}\n\`\`\``,
         response_type: 'ephemeral', // Only visible to the user who ran the command
       });
+    });
+
+    // Slash command: /agent - Switch or show agent type (claude/codex)
+    this.app.command('/agent', async ({ command, ack, respond }) => {
+      await ack();
+      const channelId = command.channel_id;
+      const userId = command.user_id;
+      const args = command.text.trim().toLowerCase();
+
+      const channelSession = this.sessionManager.getChannelSession(channelId);
+
+      if (!args) {
+        // Show current agent
+        const currentAgent = channelSession?.agentType || this.getDefaultAgentType(userId);
+        await respond({
+          text: `🤖 *Current agent:* \`${currentAgent}\`\n\n` +
+            `To switch: \`/agent claude\` or \`/agent codex\`\n` +
+            `Default: \`${this.getDefaultAgentType(userId)}\``,
+          response_type: 'ephemeral',
+        });
+        return;
+      }
+
+      if (args !== 'claude' && args !== 'codex') {
+        await respond({
+          text: `❌ Unknown agent type: \`${args}\`. Use \`claude\` or \`codex\`.`,
+          response_type: 'ephemeral',
+        });
+        return;
+      }
+
+      const newAgentType = args as AgentType;
+      const previousAgentType = channelSession?.agentType;
+      const noopSwitch = previousAgentType === newAgentType;
+
+      if (channelSession) {
+        // Kill the existing terminal but preserve session IDs in .minion-agent-sessions.json
+        // so the incoming agent can resume its own prior thread.
+        this.terminalManager.killByChannelId(channelId);
+        this.sessionManager.removeChannelSession(channelId);
+      }
+
+      // Spawn with new agent type. If a stored session exists for newAgentType,
+      // it will be picked up by terminal-manager on first sendInput as `--resume`/`exec resume`.
+      const session = this.sessionManager.getSessionByUserId(userId);
+      if (session) {
+        await this.spawnAgentForChannel(channelId, session.token, userId, this.app.client, newAgentType);
+        const priorSessionId = this.terminalManager.getSessionId(channelId, newAgentType);
+        const continuity = priorSessionId
+          ? `resuming prior \`${newAgentType}\` thread \`${priorSessionId.substring(0, 8)}…\``
+          : `starting a fresh \`${newAgentType}\` conversation`;
+        const switchVerb = noopSwitch ? 'Restarted' : 'Switched to';
+        await respond({
+          text: `🔄 ${switchVerb} \`${newAgentType}\` — ${continuity}.`,
+          response_type: 'in_channel',
+        });
+      } else {
+        await respond({
+          text: `❌ No session found. Please DM me your session token first.`,
+          response_type: 'ephemeral',
+        });
+      }
     });
   }
 
@@ -349,17 +447,22 @@ export class SlackBot {
     // Handle DM commands (case-insensitive)
     const lowerText = trimmedText.toLowerCase();
 
-    // Command: tokens - List available OAuth tokens
-    if (lowerText === 'tokens' || lowerText === '!tokens') {
-      await this.handleTokensCommand(userId, say);
+    // Command: agent <type> - Set default agent type (persisted per-user)
+    const agentMatch = lowerText.match(/^!?agent\s+(\S+)$/);
+    if (agentMatch) {
+      const type = agentMatch[1];
+      if (type !== 'claude' && type !== 'codex') {
+        await say(`❌ Unknown agent type: \`${type}\`. Use \`claude\` or \`codex\`.`);
+      } else {
+        this.sessionManager.setUserDefaultAgent(userId, type as AgentType);
+        await say(`✅ Default agent set to \`${type}\` for your new channels.`);
+      }
       return;
     }
 
-    // Command: use <alias> - Select an OAuth token
-    const useMatch = lowerText.match(/^!?use\s+(\S+)$/);
-    if (useMatch) {
-      const alias = useMatch[1];
-      await this.handleUseTokenCommand(userId, alias, say);
+    // Command: agent - Show current default
+    if (lowerText === 'agent' || lowerText === '!agent') {
+      await say(`🤖 Default agent: \`${this.getDefaultAgentType(userId)}\`\n\nTo change: \`agent claude\` or \`agent codex\``);
       return;
     }
 
@@ -379,117 +482,47 @@ export class SlackBot {
         `3. Send me that token here\n\n` +
         `⚠️ Note: Send the session token, not your Slack user ID!\n\n` +
         `*DM Commands:*\n` +
-        `• \`tokens\` - List available OAuth tokens\n` +
-        `• \`use <alias>\` - Switch to a different token\n` +
+        `• \`agent\` - Show your default agent\n` +
+        `• \`agent <claude|codex>\` - Set your default agent\n` +
         `• \`help\` - Show this help`
       );
       return;
     }
 
-    // Get user's current token
-    const currentToken = this.sessionManager.getOAuthTokenForUser(userId);
-    const tokenInfo = currentToken ? `\nCurrent token: \`${currentToken.alias}\`` : '';
-
     await say(
       `✅ You're connected! Session token: \`${session.token}\`\n` +
-      `Working directory: \`${session.workingDirectory}\`${tokenInfo}\n\n` +
-      `Create a channel and invite me to start a Claude Code instance.\n\n` +
+      `Working directory: \`${session.workingDirectory}\`\n\n` +
+      `Create a channel and invite me to start an agent session.\n\n` +
       `*DM Commands:*\n` +
-      `• \`tokens\` - List available OAuth tokens\n` +
-      `• \`use <alias>\` - Switch to a different token\n` +
+      `• \`agent\` - Show your default agent\n` +
+      `• \`agent <claude|codex>\` - Set your default agent\n` +
       `• \`help\` - Show available commands`
     );
-  }
-
-  // Handle 'tokens' command - list available OAuth tokens
-  private async handleTokensCommand(userId: string, say: (msg: string) => Promise<void>): Promise<void> {
-    const tokens = this.oauthTokens;
-
-    if (tokens.length === 0) {
-      await say(
-        `❌ No OAuth tokens configured.\n\n` +
-        `Add tokens to your \`.env\` file:\n` +
-        `• Single token: \`CLAUDE_CODE_OAUTH_TOKEN=<token>\`\n` +
-        `• Multiple tokens: \`CLAUDE_CODE_OAUTH_TOKEN_<alias>=<token>\``
-      );
-      return;
-    }
-
-    // Get user's current selection
-    const currentToken = this.sessionManager.getOAuthTokenForUser(userId);
-    const currentAlias = currentToken?.alias || 'default';
-
-    let tokenList = '*Available OAuth Tokens:*\n';
-    for (const token of tokens) {
-      const isSelected = token.alias === currentAlias;
-      const selectedMarker = isSelected ? ' ✅ (selected)' : '';
-      const defaultMarker = token.isDefault ? ' (default)' : '';
-      const preview = token.token.substring(0, 15) + '...';
-      tokenList += `• \`${token.alias}\`${defaultMarker}${selectedMarker} - \`${preview}\`\n`;
-    }
-
-    tokenList += `\nTo switch tokens: \`use <alias>\``;
-
-    await say(tokenList);
-  }
-
-  // Handle 'use <alias>' command - select an OAuth token
-  private async handleUseTokenCommand(userId: string, alias: string, say: (msg: string) => Promise<void>): Promise<void> {
-    const tokens = this.oauthTokens;
-
-    if (tokens.length === 0) {
-      await say(`❌ No OAuth tokens configured.`);
-      return;
-    }
-
-    // Find the token
-    const token = tokens.find(t => t.alias.toLowerCase() === alias.toLowerCase());
-    if (!token) {
-      const availableAliases = tokens.map(t => `\`${t.alias}\``).join(', ');
-      await say(
-        `❌ Token \`${alias}\` not found.\n\n` +
-        `Available tokens: ${availableAliases}`
-      );
-      return;
-    }
-
-    // Save preference
-    const success = this.sessionManager.setUserTokenPreference(userId, token.alias);
-    if (success) {
-      await say(
-        `✅ Switched to token \`${token.alias}\`\n\n` +
-        `All channels will use this token for future messages immediately - no reset required.`
-      );
-    } else {
-      await say(`❌ Failed to save token preference.`);
-    }
   }
 
   // Handle 'help' command in DM
   private async handleDMHelpCommand(userId: string, say: (msg: string) => Promise<void>): Promise<void> {
     const session = this.sessionManager.getSessionByUserId(userId);
-    const currentToken = this.sessionManager.getOAuthTokenForUser(userId);
 
     let status = '';
     if (session) {
       status = `*Status:* Connected (session: \`${session.token}\`)`;
-      if (currentToken) {
-        status += `\n*Current token:* \`${currentToken.alias}\``;
-      }
       status += '\n\n';
     }
 
     await say(
       `${status}*DM Commands:*\n` +
       `• \`<8-char token>\` - Connect with a session token\n` +
-      `• \`tokens\` - List available OAuth tokens\n` +
-      `• \`use <alias>\` - Switch to a different token\n` +
+      `• \`agent\` - Show current default agent\n` +
+      `• \`agent <claude|codex>\` - Set default agent type\n` +
       `• \`help\` - Show this help\n\n` +
-      `*Channel Commands:*\n` +
-      `• \`!interrupt\` - Stop current Claude operation\n` +
-      `• \`!reset\` - Start a new conversation\n` +
-      `• \`!debug\` - Show terminal output\n` +
-      `• \`!help\` - Show channel help`
+      `*Slash Commands:*\n` +
+      `• \`/reset\` - Start a new conversation\n` +
+      `• \`/interrupt\` - Stop current operation\n` +
+      `• \`/compact\` - Compact Claude Code context\n` +
+      `• \`/agent <claude|codex>\` - Switch agent type\n` +
+      `• \`/context\` - Show usage stats\n` +
+      `• \`/debug\` - Show terminal output`
     );
   }
 
@@ -498,7 +531,8 @@ export class SlackBot {
     userId: string,
     text: string,
     client: any,
-    files: string[] = []
+    files: string[] = [],
+    thread_ts?: string
   ): Promise<void> {
     const channelSession = this.sessionManager.getChannelSession(channelId);
     if (!channelSession) {
@@ -527,14 +561,14 @@ export class SlackBot {
     // Interrupt command
     if (trimmedText === '!interrupt' || trimmedText === '!stop' || trimmedText === '!esc') {
       const success = this.terminalManager.sendInterrupt(updatedSession.terminalId);
-      // Clear busy state and message queue (terminal-manager clears its queue)
+      // Clear stale pre-interrupt queued messages (terminal-manager handles this)
       this.terminalManager.clearBusyState(channelId);
       // Also clear slack-bot's message queue
       this.messageQueues.set(channelId, []);
       if (success) {
         await client.chat.postMessage({
           channel: channelId,
-          text: `⏹️ Interrupted Claude Code (sent Ctrl+C) and cleared message queue`,
+          text: `⏹️ Interrupted Claude Code (sent Ctrl+C). Waiting for shell to be ready — your next message will be queued and sent automatically.`,
         });
       } else {
         await client.chat.postMessage({
@@ -588,8 +622,13 @@ export class SlackBot {
       messageWithFiles = `${text}\n\n[Attached files saved to:\n${fileList}]`;
     }
 
+    // Add thread context if the message is in a thread
+    if (thread_ts) {
+      messageWithFiles = `[Thread reply (thread_ts: ${thread_ts})]\n${messageWithFiles}`;
+    }
+
     // Queue the message and trigger Claude to check
-    this.queueMessage(channelId, userId, messageWithFiles);
+    this.queueMessage(channelId, userId, messageWithFiles, thread_ts);
 
     // Check if Claude is busy and notify user
     if (this.terminalManager.isChannelBusy(channelId)) {
@@ -626,7 +665,7 @@ export class SlackBot {
     }
   }
 
-  private queueMessage(channelId: string, userId: string, text: string): void {
+  private queueMessage(channelId: string, userId: string, text: string, thread_ts?: string): void {
     if (!this.messageQueues.has(channelId)) {
       this.messageQueues.set(channelId, []);
     }
@@ -636,6 +675,7 @@ export class SlackBot {
       user: userId,
       text: text,
       timestamp: new Date(),
+      thread_ts,
     });
 
     // Keep only last 100 messages
@@ -683,17 +723,33 @@ export class SlackBot {
     }
   }
 
-  private async spawnClaudeCodeForChannel(
+  // Resolution order: per-user persisted setting → DEFAULT_AGENT env → 'claude'.
+  private getDefaultAgentType(userId?: string): AgentType {
+    if (userId) {
+      const userDefault = this.sessionManager.getUserDefaultAgent(userId);
+      if (userDefault) return userDefault;
+    }
+    const envDefault = process.env.DEFAULT_AGENT?.toLowerCase();
+    if (envDefault === 'codex') return 'codex';
+    return 'claude';
+  }
+
+  private async spawnAgentForChannel(
     channelId: string,
     sessionToken: string,
     userId: string,
-    client: any | null
+    client: any | null,
+    agentType?: AgentType
   ): Promise<void> {
     const session = this.sessionManager.getSessionByToken(sessionToken);
     if (!session) {
       console.error('Session not found:', sessionToken);
       return;
     }
+
+    // Resolution: explicit arg → persisted channel agent (survives bot restart) → user/env default.
+    const existingChannelSession = this.sessionManager.getChannelSession(channelId);
+    const effectiveAgentType = agentType || existingChannelSession?.agentType || this.getDefaultAgentType(userId);
 
     // Get user's selected OAuth token
     const userToken = this.sessionManager.getOAuthTokenForUser(userId);
@@ -704,43 +760,93 @@ export class SlackBot {
       channelId,
       sessionToken,
       userId,
-      '' // Will update after terminal creation
+      '', // Will update after terminal creation
+      effectiveAgentType
     );
 
     try {
-      // Spawn Claude Code with user's selected OAuth token
-      const terminal = await this.terminalManager.spawnClaudeCode(
+      // Spawn agent with user's selected OAuth token
+      const terminal = await this.terminalManager.spawnAgent(
         channelId,
         channelSession.mcpPort,
+        effectiveAgentType,
         oauthTokenValue
       );
 
       // Update channel session with terminal ID
       channelSession.terminalId = terminal.id;
+      this.sessionManager.updateChannelSessionTerminal(channelId, terminal.id, terminal.mcpPort);
 
-      // Build token info for message
+      // Build info for message
       const tokenInfo = userToken ? `\nUsing token: \`${userToken.alias}\`` : '';
+      const agentLabel = effectiveAgentType === 'claude' ? 'Claude Code' : 'Codex';
 
-      // Only post message if client is provided (not from DM where we use say())
       if (client) {
         await client.chat.postMessage({
           channel: channelId,
-          text: `Claude Code started! Send a message to interact with it.\n` +
+          text: `${agentLabel} started! Send a message to interact with it.\n` +
             `Working directory: \`${session.workingDirectory}\`${tokenInfo}`,
         });
       }
 
-      console.log(`Spawned Claude Code for channel ${channelId} on MCP port ${channelSession.mcpPort}${userToken ? ` using token ${userToken.alias}` : ''}`);
+      console.log(`Spawned ${agentLabel} for channel ${channelId} on MCP port ${channelSession.mcpPort}${userToken ? ` using token ${userToken.alias}` : ''}`);
     } catch (error) {
-      console.error('Failed to spawn Claude Code:', error);
+      console.error(`Failed to spawn ${effectiveAgentType}:`, error);
       this.sessionManager.removeChannelSession(channelId);
       if (client) {
         await client.chat.postMessage({
           channel: channelId,
-          text: `Failed to start Claude Code. Please try again.`,
+          text: `Failed to start agent. Please try again.`,
         });
       }
     }
+  }
+
+  async restorePersistedChannelSessions(): Promise<void> {
+    const sessions = this.sessionManager
+      .getAllChannelSessions()
+      .filter((channelSession) => channelSession.agentType === 'codex');
+    if (sessions.length === 0) {
+      console.log('[Restore] No persisted Codex channel sessions to restore');
+      return;
+    }
+
+    console.log(`[Restore] Restoring ${sessions.length} persisted Codex channel session(s)`);
+    for (const channelSession of sessions) {
+      if (channelSession.terminalId && this.terminalManager.getTerminal(channelSession.terminalId)) {
+        console.log(`[Restore] Channel ${channelSession.channelId} already has a live terminal`);
+        continue;
+      }
+
+      const session = this.sessionManager.getSessionByToken(channelSession.sessionToken);
+      if (!session) {
+        console.warn(`[Restore] Skipping channel ${channelSession.channelId}: session token ${channelSession.sessionToken} no longer exists`);
+        continue;
+      }
+
+      try {
+        console.log(`[Restore] Respawning ${channelSession.agentType} for channel ${channelSession.channelId}`);
+        await this.spawnAgentForChannel(
+          channelSession.channelId,
+          channelSession.sessionToken,
+          channelSession.userId,
+          null,
+          channelSession.agentType
+        );
+      } catch (error) {
+        console.error(`[Restore] Failed to restore channel ${channelSession.channelId}:`, error);
+      }
+    }
+  }
+
+  // Backwards-compatible alias
+  private async spawnClaudeCodeForChannel(
+    channelId: string,
+    sessionToken: string,
+    userId: string,
+    client: any | null
+  ): Promise<void> {
+    return this.spawnAgentForChannel(channelId, sessionToken, userId, client);
   }
 
   // HTTP server to receive messages from MCP servers and serve pending messages
@@ -765,9 +871,15 @@ export class SlackBot {
         req.on('end', async () => {
           try {
             const data = JSON.parse(body);
-            await this.handleMCPMessage(data);
-            res.writeHead(200);
-            res.end('OK');
+            const result = await this.handleMCPMessage(data);
+            // Return JSON result for canvas operations, plain OK for others
+            if (result) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(result));
+            } else {
+              res.writeHead(200);
+              res.end('OK');
+            }
           } catch (error) {
             console.error('Error handling MCP message:', error);
             res.writeHead(500);
@@ -786,11 +898,14 @@ export class SlackBot {
     });
   }
 
-  private async handleMCPMessage(data: any): Promise<void> {
-    const { type, channelId, content, filename, fileContent, mentionText } = data;
+  private async handleMCPMessage(data: any): Promise<any> {
+    const { type, channelId, content, filename, fileContent, mentionText, thread_ts } = data;
 
     const channelSession = this.sessionManager.getChannelSession(channelId);
     const userId = channelSession?.userId;
+
+    // Build optional thread_ts for all message types
+    const threadOpts = thread_ts ? { thread_ts } : {};
 
     switch (type) {
       case 'markdown':
@@ -799,10 +914,11 @@ export class SlackBot {
             channel: channelId,
             text: content,
             mrkdwn: true,
+            ...threadOpts,
           }),
           `postMessage(markdown) to ${channelId}`
         );
-        break;
+        return null;
 
       case 'file':
         await retrySlackCall(
@@ -811,10 +927,11 @@ export class SlackBot {
             content: fileContent,
             filename: filename,
             title: filename,
+            ...(thread_ts ? { thread_ts } : {}),
           }),
           `filesUploadV2(file) to ${channelId}`
         );
-        break;
+        return null;
 
       case 'file_upload':
         // Handle binary file upload (base64 encoded)
@@ -826,10 +943,11 @@ export class SlackBot {
             file: fileBuffer,
             filename: filename,
             title: title || filename,
+            ...(thread_ts ? { thread_ts } : {}),
           }),
           `filesUploadV2(file_upload) to ${channelId}`
         );
-        break;
+        return null;
 
       case 'mention':
         const mention = userId ? `<@${userId}>` : '';
@@ -838,10 +956,11 @@ export class SlackBot {
             channel: channelId,
             text: `${mention} ${mentionText || content}`,
             mrkdwn: true,
+            ...threadOpts,
           }),
           `postMessage(mention) to ${channelId}`
         );
-        break;
+        return null;
 
       case 'action':
         // Notification of action being taken
@@ -850,10 +969,11 @@ export class SlackBot {
             channel: channelId,
             text: `🔄 ${content}`,
             mrkdwn: true,
+            ...threadOpts,
           }),
           `postMessage(action) to ${channelId}`
         );
-        break;
+        return null;
 
       case 'result':
         // Notification of action result
@@ -862,13 +982,94 @@ export class SlackBot {
             channel: channelId,
             text: `✅ ${content}`,
             mrkdwn: true,
+            ...threadOpts,
           }),
           `postMessage(result) to ${channelId}`
         );
-        break;
+        return null;
+
+      case 'canvas_create': {
+        // Create a standalone canvas (optionally added to a channel tab via channel_id)
+        const createArgs: any = {};
+        if (data.title) {
+          createArgs.title = data.title;
+        }
+        if (data.markdown) {
+          createArgs.document_content = {
+            type: 'markdown',
+            markdown: data.markdown,
+          };
+        }
+        if (data.canvas_channel_id) {
+          createArgs.channel_id = data.canvas_channel_id;
+        }
+        const createResult = await retrySlackCall(
+          () => (this.app.client as any).apiCall('canvases.create', createArgs),
+          `canvases.create for ${channelId}`
+        ) as any;
+        console.log(`[Canvas] Created canvas: ${createResult.canvas_id}`);
+        return { ok: createResult.ok, canvas_id: createResult.canvas_id, error: createResult.error };
+      }
+
+      case 'canvas_edit': {
+        // Edit an existing canvas
+        const change: any = {
+          operation: data.operation,
+        };
+        if (data.operation === 'rename') {
+          change.title_content = {
+            type: 'markdown',
+            markdown: data.markdown || '',
+          };
+        } else if (data.operation === 'delete') {
+          change.section_id = data.section_id;
+        } else {
+          if (data.markdown) {
+            change.document_content = {
+              type: 'markdown',
+              markdown: data.markdown,
+            };
+          }
+          if (data.section_id) {
+            change.section_id = data.section_id;
+          }
+        }
+        const editResult = await retrySlackCall(
+          () => (this.app.client as any).apiCall('canvases.edit', {
+            canvas_id: data.canvas_id,
+            changes: [change],
+          }),
+          `canvases.edit(${data.operation}) for ${data.canvas_id}`
+        ) as any;
+        console.log(`[Canvas] Edited canvas ${data.canvas_id}: ${data.operation}`);
+        return { ok: editResult.ok, error: editResult.error };
+      }
+
+      case 'canvas_create_channel': {
+        // Create a canvas and add it as a channel tab using channel_id param
+        const channelCanvasArgs: any = {
+          channel_id: data.canvas_channel_id,
+        };
+        if (data.title) {
+          channelCanvasArgs.title = data.title;
+        }
+        if (data.markdown) {
+          channelCanvasArgs.document_content = {
+            type: 'markdown',
+            markdown: data.markdown,
+          };
+        }
+        const channelCanvasResult = await retrySlackCall(
+          () => (this.app.client as any).apiCall('canvases.create', channelCanvasArgs),
+          `canvases.create with channel_id ${data.canvas_channel_id}`
+        ) as any;
+        console.log(`[Canvas] Created channel canvas tab: ${channelCanvasResult.canvas_id} in ${data.canvas_channel_id}`);
+        return { ok: channelCanvasResult.ok, canvas_id: channelCanvasResult.canvas_id, error: channelCanvasResult.error };
+      }
 
       default:
         console.log('Unknown MCP message type:', type);
+        return null;
     }
   }
 

@@ -3,6 +3,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { TerminalInstance } from './types.js';
 import * as path from 'path';
 import * as fs from 'fs';
+import { execSync } from 'child_process';
+import { AgentType, AgentStrategy, createAgentStrategy } from './agents/index.js';
 
 // Dynamic import for strip-ansi (ESM module)
 let stripAnsi: (text: string) => string;
@@ -26,12 +28,15 @@ export class TerminalManager {
   private workingDirectory: string;
   private appDirectory: string;
   private mcpConfigs: Map<string, string> = new Map(); // channelId -> mcpConfigPath
-  private sessionIds: Map<string, string> = new Map(); // channelId -> claude session UUID
-  private sessionIdsFilePath: string; // Path to persist session IDs
-  private busyChannels: Set<string> = new Set(); // channels with running claude commands
+  private sessionIds: Map<string, Partial<Record<AgentType, string>>> = new Map(); // channelId -> { claude?, codex? }
+  private sessionIdsFilePath: string; // Path to persist session IDs (agent-keyed)
+  private legacySessionIdsFilePath: string; // Old single-agent file for one-time migration
+  private busyChannels: Set<string> = new Set(); // channels with running commands
+  private interruptedChannels: Set<string> = new Set(); // channels that were interrupted and waiting for shell to be ready
   private messageQueues: Map<string, QueuedMessage[]> = new Map(); // channelId -> queued messages
-  private awaitingSessionId: Set<string> = new Set(); // channels waiting to capture session_id from JSON output
-  private latestUsageStats: Map<string, any> = new Map(); // channelId -> latest usage stats from JSON output
+  private awaitingSessionId: Set<string> = new Set(); // channels waiting to capture session_id from output
+  private latestUsageStats: Map<string, any> = new Map(); // channelId -> latest usage stats
+  private agentStrategies: Map<string, AgentStrategy> = new Map(); // channelId -> strategy
   private onQueueProcessCallback?: (channelId: string, message: string) => Promise<void>;
   private onAgentTurnCompleteCallback?: (channelId: string) => Promise<void>;
 
@@ -43,21 +48,35 @@ export class TerminalManager {
   ) {
     this.workingDirectory = workingDirectory;
     this.appDirectory = appDirectory;
-    this.sessionIdsFilePath = path.join(workingDirectory, '.minion-claude-sessions.json');
+    this.sessionIdsFilePath = path.join(workingDirectory, '.minion-agent-sessions.json');
+    this.legacySessionIdsFilePath = path.join(workingDirectory, '.minion-claude-sessions.json');
     this.onQueueProcessCallback = onQueueProcess;
     this.onAgentTurnCompleteCallback = onAgentTurnComplete;
     this.loadSessionIds();
   }
 
-  // Load persisted session IDs from disk
+  // Load persisted session IDs from disk (agent-keyed format).
+  // Falls back to legacy single-agent format and migrates it forward.
   private loadSessionIds(): void {
     try {
       if (fs.existsSync(this.sessionIdsFilePath)) {
         const data = JSON.parse(fs.readFileSync(this.sessionIdsFilePath, 'utf-8'));
-        for (const [channelId, sessionId] of Object.entries(data)) {
-          this.sessionIds.set(channelId, sessionId as string);
+        for (const [channelId, value] of Object.entries(data)) {
+          if (typeof value === 'string') {
+            // Defensive: tolerate stray legacy entry written into the new file
+            this.sessionIds.set(channelId, { claude: value });
+          } else if (value && typeof value === 'object') {
+            this.sessionIds.set(channelId, value as Partial<Record<AgentType, string>>);
+          }
         }
-        console.log(`[SessionIds] Loaded ${this.sessionIds.size} persisted Claude session IDs`);
+        console.log(`[SessionIds] Loaded ${this.sessionIds.size} persisted session entries`);
+      } else if (fs.existsSync(this.legacySessionIdsFilePath)) {
+        const data = JSON.parse(fs.readFileSync(this.legacySessionIdsFilePath, 'utf-8'));
+        for (const [channelId, sessionId] of Object.entries(data)) {
+          this.sessionIds.set(channelId, { claude: sessionId as string });
+        }
+        console.log(`[SessionIds] Migrated ${this.sessionIds.size} legacy claude session(s) → agent-keyed format`);
+        this.saveSessionIds();
       }
     } catch (error) {
       console.error('[SessionIds] Error loading session IDs:', error);
@@ -67,7 +86,7 @@ export class TerminalManager {
   // Save session IDs to disk
   private saveSessionIds(): void {
     try {
-      const data: Record<string, string> = {};
+      const data: Record<string, Partial<Record<AgentType, string>>> = {};
       this.sessionIds.forEach((v, k) => data[k] = v);
       fs.writeFileSync(this.sessionIdsFilePath, JSON.stringify(data, null, 2));
     } catch (error) {
@@ -75,48 +94,77 @@ export class TerminalManager {
     }
   }
 
-  async spawnClaudeCode(channelId: string, mcpPort: number, oauthToken?: string): Promise<TerminalInstance> {
+  private getStoredSessionId(channelId: string, agentType: AgentType): string | undefined {
+    return this.sessionIds.get(channelId)?.[agentType];
+  }
+
+  private setStoredSessionId(channelId: string, agentType: AgentType, sessionId: string): void {
+    const entry = this.sessionIds.get(channelId) || {};
+    entry[agentType] = sessionId;
+    this.sessionIds.set(channelId, entry);
+  }
+
+  private clearStoredSessionId(channelId: string, agentType: AgentType): void {
+    const entry = this.sessionIds.get(channelId);
+    if (!entry) return;
+    delete entry[agentType];
+    if (Object.keys(entry).length === 0) {
+      this.sessionIds.delete(channelId);
+    } else {
+      this.sessionIds.set(channelId, entry);
+    }
+  }
+
+  // Get or create agent strategy for a channel
+  getAgentStrategy(channelId: string): AgentStrategy | undefined {
+    return this.agentStrategies.get(channelId);
+  }
+
+  // Set agent strategy for a channel
+  setAgentStrategy(channelId: string, strategy: AgentStrategy): void {
+    this.agentStrategies.set(channelId, strategy);
+  }
+
+  async spawnAgent(channelId: string, mcpPort: number, agentType: AgentType = 'claude', oauthToken?: string): Promise<TerminalInstance> {
     const id = uuidv4();
+    const strategy = createAgentStrategy(agentType);
+    this.agentStrategies.set(channelId, strategy);
 
-    // Create MCP config for this instance (stored in app directory)
-    const mcpConfigDir = path.join(this.appDirectory, '.claude-minion', channelId);
-    fs.mkdirSync(mcpConfigDir, { recursive: true });
-
-    const mcpConfigPath = path.join(mcpConfigDir, 'mcp-config.json');
-    const mcpConfig = {
-      mcpServers: {
-        'slack-messenger': {
-          command: 'node',
-          args: [path.join(this.appDirectory, 'dist', 'mcp-server.js')],
-          env: {
-            MCP_PORT: mcpPort.toString(),
-            CHANNEL_ID: channelId,
-            ORCHESTRATOR_URL: `http://localhost:${process.env.ORCHESTRATOR_PORT || 3000}`,
-          },
-        },
-      },
-    };
-    fs.writeFileSync(mcpConfigPath, JSON.stringify(mcpConfig, null, 2));
+    // Create MCP config using the strategy
+    const mcpConfigPath = strategy.createMcpConfig({
+      channelId,
+      mcpPort,
+      appDirectory: this.appDirectory,
+      workingDirectory: this.workingDirectory,
+    });
 
     // Store MCP config path for this channel
     this.mcpConfigs.set(channelId, mcpConfigPath);
-    // Session ID will be captured from first command's JSON output
 
-    // Spawn a shell for running claude commands
+    // Spawn a shell for running agent commands
     const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
 
-    // Build environment with optional OAuth token override
+    // Build environment with optional token override.
+    // ORCHESTRATOR_URL is set so codex's MCP child (which inherits from PTY) hits the right port;
+    // claude-strategy still overrides this in its own MCP env block, so this is effectively
+    // codex-only but harmless to set unconditionally.
+    const orchestratorPort = process.env.ORCHESTRATOR_PORT || '3000';
     const spawnEnv: Record<string, string | undefined> = {
       ...process.env,
       TERM: 'xterm-256color',
       MCP_PORT: mcpPort.toString(),
       CHANNEL_ID: channelId,
+      ORCHESTRATOR_URL: `http://localhost:${orchestratorPort}`,
     };
 
-    // If a specific OAuth token is provided, use it instead of the inherited one
+    // Remove CLAUDECODE env var to prevent "nested session" detection
+    delete spawnEnv.CLAUDECODE;
+
+    // Apply agent-specific env vars (CODEX_HOME is always set for codex; token is optional)
+    const agentEnv = strategy.getEnvVars({ oauthToken, workingDirectory: this.workingDirectory });
+    Object.assign(spawnEnv, agentEnv);
     if (oauthToken) {
-      spawnEnv.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
-      console.log(`[Terminal ${channelId}] Using specific OAuth token (${oauthToken.substring(0, 15)}...)`);
+      console.log(`[Terminal ${channelId}] Using ${agentType} with specific token`);
     }
 
     const ptyProcess = pty.spawn(shell, [], {
@@ -143,80 +191,56 @@ export class TerminalManager {
       const buffer = this.outputBuffers.get(id);
       if (buffer) {
         buffer.push(data);
-        // Keep only last 1000 lines
         if (buffer.length > 1000) {
           buffer.shift();
         }
       }
       terminal.lastActivity = new Date();
-      // Debug: log terminal output
       const cleanData = stripAnsi ? stripAnsi(data) : data;
       if (cleanData.trim()) {
         console.log(`[Terminal ${channelId}] ${cleanData}`);
       }
 
-      // Extract session_id from JSON output if we're waiting for it
+      // Extract session_id from output using agent strategy
       if (this.awaitingSessionId.has(channelId)) {
-        // Look for session_id in JSON output: "session_id": "uuid"
-        const sessionMatch = cleanData.match(/"session_id"\s*:\s*"([^"]+)"/);
-        if (sessionMatch) {
-          const extractedSessionId = sessionMatch[1];
-          this.sessionIds.set(channelId, extractedSessionId);
+        const extractedSessionId = strategy.parseSessionId(cleanData);
+        if (extractedSessionId) {
+          this.setStoredSessionId(channelId, strategy.type, extractedSessionId);
           this.awaitingSessionId.delete(channelId);
-          this.saveSessionIds(); // Persist to disk for restart recovery
-          console.log(`[Session] Captured session ID for channel ${channelId}: ${extractedSessionId.substring(0, 8)}...`);
+          this.saveSessionIds();
+          console.log(`[Session] Captured ${strategy.type} session ID for channel ${channelId}: ${extractedSessionId.substring(0, 8)}...`);
         }
       }
 
-      // Extract usage stats from JSON result
-      // Look for {"type":"result"...} and parse it
-      const resultStart = cleanData.indexOf('{"type":"result"');
-      if (resultStart !== -1) {
-        // Find matching closing brace
-        let braceCount = 0;
-        let endIdx = -1;
-        for (let i = resultStart; i < cleanData.length; i++) {
-          if (cleanData[i] === '{') braceCount++;
-          if (cleanData[i] === '}') braceCount--;
-          if (braceCount === 0) {
-            endIdx = i + 1;
-            break;
-          }
-        }
-        if (endIdx !== -1) {
-          try {
-            const resultJson = JSON.parse(cleanData.substring(resultStart, endIdx));
-            if (resultJson.usage) {
-              this.latestUsageStats.set(channelId, resultJson.usage);
-              console.log(`[Usage] Captured usage stats for channel ${channelId}`);
-            }
-          } catch (e) {
-            // JSON not complete yet, ignore
-          }
-        }
+      // Extract usage stats using agent strategy
+      const usage = strategy.parseUsageStats(cleanData);
+      if (usage) {
+        this.latestUsageStats.set(channelId, usage);
+        console.log(`[Usage] Captured usage stats for channel ${channelId}`);
       }
 
-      // Detect when Claude command finishes using sentinel marker
-      // The marker must appear at the START of a line (after newline) to distinguish
-      // from the shell echoing the command itself
+      // Detect when command finishes using agent strategy's done marker
       if (this.busyChannels.has(channelId)) {
-        // Check if marker appears at start of line (real output) vs embedded in command echo
         const lines = cleanData.split('\n');
         for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (trimmedLine === '___CLAUDE_DONE___') {
-            // Command finished
-            this.busyChannels.delete(channelId);
-            console.log(`[Terminal ${channelId}] Claude command finished`);
+          if (strategy.isDoneMarker(line)) {
+            const wasInterrupted = this.interruptedChannels.has(channelId);
 
-            // Notify that agent turn is complete
-            if (this.onAgentTurnCompleteCallback) {
+            this.busyChannels.delete(channelId);
+            this.interruptedChannels.delete(channelId);
+
+            if (wasInterrupted) {
+              console.log(`[Terminal ${channelId}] Shell ready after interrupt — processing queued messages`);
+            } else {
+              console.log(`[Terminal ${channelId}] ${agentType} command finished`);
+            }
+
+            if (!wasInterrupted && this.onAgentTurnCompleteCallback) {
               this.onAgentTurnCompleteCallback(channelId).catch(err => {
                 console.error('[AgentTurnComplete] Error in callback:', err);
               });
             }
 
-            // Process next queued message immediately
             this.processQueue(channelId);
             break;
           }
@@ -236,8 +260,12 @@ export class TerminalManager {
     return terminal;
   }
 
-  // Queue a message to be sent to Claude (handles busy state)
-  // oauthToken: Optional OAuth token to use for this command (enables dynamic token switching)
+  // Backwards-compatible alias
+  async spawnClaudeCode(channelId: string, mcpPort: number, oauthToken?: string): Promise<TerminalInstance> {
+    return this.spawnAgent(channelId, mcpPort, 'claude', oauthToken);
+  }
+
+  // Queue a message to be sent to agent (handles busy state)
   async sendInput(terminalId: string, input: string, oauthToken?: string): Promise<boolean> {
     const terminal = this.terminals.get(terminalId);
     if (!terminal) {
@@ -247,22 +275,19 @@ export class TerminalManager {
 
     const channelId = terminal.channelId;
 
-    // If channel is busy, queue the message
     if (this.busyChannels.has(channelId)) {
       console.log(`[Queue] Channel ${channelId} is busy, queuing message`);
       return new Promise((resolve) => {
         const queue = this.messageQueues.get(channelId) || [];
-        queue.push({ input, resolve, oauthToken });  // Store token with queued message
+        queue.push({ input, resolve, oauthToken });
         this.messageQueues.set(channelId, queue);
       });
     }
 
-    // Send immediately
     return this.sendInputNow(terminalId, input, oauthToken);
   }
 
-  // Actually send input to Claude (internal method)
-  // oauthToken: If provided, this token is used for this specific command (dynamic token switching)
+  // Actually send input to agent (internal method)
   private sendInputNow(terminalId: string, input: string, oauthToken?: string): boolean {
     const terminal = this.terminals.get(terminalId);
     if (!terminal) {
@@ -277,43 +302,37 @@ export class TerminalManager {
       return false;
     }
 
-    // Escape the input for shell (use double quotes and escape properly)
-    const escapedInput = input
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\$/g, '\\$')
-      .replace(/`/g, '\\`')
-      .replace(/\n/g, ' ')  // Replace newlines with spaces to avoid shell continuation prompts
-      .replace(/\r/g, '');  // Remove carriage returns
+    const strategy = this.agentStrategies.get(channelId);
+    if (!strategy) {
+      console.error(`No agent strategy found for channel ${channelId}`);
+      return false;
+    }
 
     // Mark channel as busy
     this.busyChannels.add(channelId);
 
-    // Build the claude command - always use --output-format json to capture usage stats
-    const existingSessionId = this.sessionIds.get(channelId);
+    const existingSessionId = this.getStoredSessionId(channelId, strategy.type);
 
-    // Get model from environment variable, default to sonnet-4.5
-    const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250929';
+    const terminalForOpts = this.terminals.get(terminalId);
+    // Build command using agent strategy
+    const cmd = strategy.buildCommand(input, {
+      mcpConfigPath,
+      sessionId: existingSessionId,
+      oauthToken,
+      workingDirectory: this.workingDirectory,
+      channelId,
+      mcpPort: terminalForOpts?.mcpPort,
+    });
 
-    // Build token prefix if provided (for dynamic token switching)
-    // This allows changing tokens without respawning the terminal
-    const tokenPrefix = oauthToken ? `CLAUDE_CODE_OAUTH_TOKEN="${oauthToken}" ` : '';
-
-    let claudeCmd: string;
-    if (existingSessionId) {
-      // Resume existing session
-      claudeCmd = `${tokenPrefix}claude -p "${escapedInput}" --model ${model} --output-format json --resume "${existingSessionId}" --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
-      const tokenLog = oauthToken ? ` (token: ${oauthToken.substring(0, 15)}...)` : '';
-      console.log(`[Sending to Claude] claude -p "..." --model ${model} --output-format json --resume "${existingSessionId.substring(0, 8)}..."${tokenLog}`);
-    } else {
-      // Start new conversation
-      claudeCmd = `${tokenPrefix}claude -p "${escapedInput}" --model ${model} --output-format json --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
+    if (!existingSessionId) {
       this.awaitingSessionId.add(channelId);
-      const tokenLog = oauthToken ? ` (token: ${oauthToken.substring(0, 15)}...)` : '';
-      console.log(`[Sending to Claude] claude -p "..." --model ${model} --output-format json (new conversation)${tokenLog}`);
     }
 
-    terminal.pty.write(claudeCmd + '\r');
+    const tokenLog = oauthToken ? ' (token provided)' : '';
+    const sessionLog = existingSessionId ? ` --resume "${existingSessionId.substring(0, 8)}..."` : ' (new conversation)';
+    console.log(`[Sending to ${strategy.type}] ${strategy.type} -p "..."${sessionLog}${tokenLog}`);
+
+    terminal.pty.write(cmd + '\r');
     terminal.lastActivity = new Date();
     return true;
   }
@@ -327,7 +346,6 @@ export class TerminalManager {
 
     const terminal = this.getTerminalByChannelId(channelId);
     if (!terminal) {
-      // Clear queue if terminal is gone
       this.messageQueues.delete(channelId);
       return;
     }
@@ -335,24 +353,20 @@ export class TerminalManager {
     const next = queue.shift()!;
     console.log(`[Queue] Processing next message for channel ${channelId}`);
 
-    // Notify via callback that we're processing this message
     if (this.onQueueProcessCallback) {
       this.onQueueProcessCallback(channelId, next.input).catch(err => {
         console.error('[Queue] Error in callback:', err);
       });
     }
 
-    // Pass the stored OAuth token (from when message was queued)
     const success = this.sendInputNow(terminal.id, next.input, next.oauthToken);
     next.resolve(success);
   }
 
-  // Check if channel is currently processing a command
   isChannelBusy(channelId: string): boolean {
     return this.busyChannels.has(channelId);
   }
 
-  // Get queue length for a channel
   getQueueLength(channelId: string): number {
     return this.messageQueues.get(channelId)?.length || 0;
   }
@@ -369,7 +383,6 @@ export class TerminalManager {
     return true;
   }
 
-  // Send interrupt (Ctrl+C) to stop current claude command
   sendInterrupt(terminalId: string): boolean {
     const terminal = this.terminals.get(terminalId);
     if (!terminal) {
@@ -377,9 +390,60 @@ export class TerminalManager {
       return false;
     }
 
-    // Send Ctrl+C
+    const channelId = terminal.channelId;
+    this.interruptedChannels.add(channelId);
+
     terminal.pty.write('\x03');
     terminal.lastActivity = new Date();
+    console.log(`[Interrupt] Sent Ctrl+C to channel ${channelId}`);
+
+    const ptyPid = terminal.pty.pid;
+    if (ptyPid) {
+      try {
+        const children = execSync(
+          `pgrep -P ${ptyPid} 2>/dev/null || true`,
+          { encoding: 'utf-8', timeout: 3000 }
+        ).trim();
+
+        if (children) {
+          const childPids = children.split('\n').filter(p => p.trim());
+          for (const childPid of childPids) {
+            try {
+              process.kill(parseInt(childPid), 'SIGTERM');
+              console.log(`[Interrupt] Sent SIGTERM to child process ${childPid} of PTY ${ptyPid}`);
+            } catch (e: any) {
+              if (e.code !== 'ESRCH') {
+                console.error(`[Interrupt] Error killing child ${childPid}:`, e.message);
+              }
+            }
+          }
+
+          setTimeout(() => {
+            for (const childPid of childPids) {
+              try {
+                process.kill(parseInt(childPid), 0);
+                process.kill(parseInt(childPid), 'SIGKILL');
+                console.log(`[Interrupt] Sent SIGKILL to stubborn process ${childPid}`);
+              } catch (e: any) {
+                // Process already gone — good
+              }
+            }
+          }, 3000);
+        }
+      } catch (e: any) {
+        console.error(`[Interrupt] Error finding child processes:`, e.message);
+      }
+    }
+
+    setTimeout(() => {
+      if (this.interruptedChannels.has(channelId)) {
+        console.log(`[Interrupt] Safety timeout for channel ${channelId} — force-clearing busy state`);
+        this.interruptedChannels.delete(channelId);
+        this.busyChannels.delete(channelId);
+        this.processQueue(channelId);
+      }
+    }, 10000);
+
     return true;
   }
 
@@ -390,7 +454,6 @@ export class TerminalManager {
     }
 
     const result = buffer.slice(-lines);
-    // Strip ANSI codes for cleaner output
     return result.map(line => stripAnsi ? stripAnsi(line) : line);
   }
 
@@ -441,43 +504,47 @@ export class TerminalManager {
     return true;
   }
 
-  // Reset conversation for a channel (clears session so next message starts fresh)
-  resetConversation(channelId: string): void {
-    // Clear session ID so next message will start a new conversation
-    this.sessionIds.delete(channelId);
+  resetConversation(channelId: string, agentType?: AgentType): void {
+    // Clear only the slot for the requested agent (or the channel's current strategy).
+    // Other agents' resumable threads are preserved.
+    const targetAgent = agentType || this.agentStrategies.get(channelId)?.type;
+    if (targetAgent) {
+      this.clearStoredSessionId(channelId, targetAgent);
+    } else {
+      this.sessionIds.delete(channelId);
+    }
     this.awaitingSessionId.delete(channelId);
-    this.saveSessionIds(); // Persist deletion to disk
-    // Clear busy state and queue
+    this.saveSessionIds();
     this.busyChannels.delete(channelId);
+    this.interruptedChannels.delete(channelId);
     this.messageQueues.delete(channelId);
-    console.log(`[Reset] Cleared session for channel ${channelId}, next message will start new conversation`);
+    console.log(`[Reset] Cleared ${targetAgent || 'all'} session(s) for channel ${channelId}`);
   }
 
-  // Clear busy state for a channel (call after interrupt)
   clearBusyState(channelId: string): void {
-    this.busyChannels.delete(channelId);
-    // Also clear message queue since queued messages are likely no longer relevant
     const queueLength = this.messageQueues.get(channelId)?.length || 0;
     this.messageQueues.delete(channelId);
-    console.log(`[Interrupt] Cleared busy state for channel ${channelId}, dropped ${queueLength} queued message(s)`);
+    console.log(`[Interrupt] Cleared pre-interrupt queue for channel ${channelId}, dropped ${queueLength} stale message(s). Waiting for shell readiness...`);
   }
 
-  // Get session ID for a channel
-  getSessionId(channelId: string): string | undefined {
-    return this.sessionIds.get(channelId);
+  // Get the stored session ID for a channel + agent. If agentType is omitted,
+  // uses the channel's current active strategy.
+  getSessionId(channelId: string, agentType?: AgentType): string | undefined {
+    const targetAgent = agentType || this.agentStrategies.get(channelId)?.type;
+    if (!targetAgent) return undefined;
+    return this.getStoredSessionId(channelId, targetAgent);
   }
 
-  // Get MCP config path for a channel
   getMcpConfigPath(channelId: string): string | undefined {
     return this.mcpConfigs.get(channelId);
   }
 
-  // Get latest usage stats for a channel
   getLatestUsageStats(channelId: string): any | undefined {
     return this.latestUsageStats.get(channelId);
   }
 
   // Send input with JSON output format and return the parsed result
+  // Note: This is primarily used by Claude strategy for /context command
   async sendInputWithJsonOutput(terminalId: string, input: string): Promise<any> {
     const terminal = this.terminals.get(terminalId);
     if (!terminal) {
@@ -490,29 +557,24 @@ export class TerminalManager {
       throw new Error(`MCP config not found for channel ${channelId}`);
     }
 
-    // Escape the input for shell
-    const escapedInput = input
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\$/g, '\\$')
-      .replace(/`/g, '\\`')
-      .replace(/\n/g, ' ')
-      .replace(/\r/g, '');
-
-    const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250929';
-    const existingSessionId = this.sessionIds.get(channelId);
-
-    // Build command with --output-format json
-    let claudeCmd: string;
-    if (existingSessionId) {
-      claudeCmd = `claude -p "${escapedInput}" --model ${model} --output-format json --resume "${existingSessionId}" --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
-    } else {
-      claudeCmd = `claude -p "${escapedInput}" --model ${model} --output-format json --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
+    const strategy = this.agentStrategies.get(channelId);
+    if (!strategy) {
+      throw new Error(`No agent strategy found for channel ${channelId}`);
     }
 
-    console.log(`[/context] Sending: claude -p "..." --model ${model} --output-format json${existingSessionId ? ` --resume "${existingSessionId.substring(0, 8)}..."` : ''}`);
+    const existingSessionId = this.getStoredSessionId(channelId, strategy.type);
 
-    // Mark channel as busy
+    // Build command using agent strategy
+    const cmd = strategy.buildCommand(input, {
+      mcpConfigPath,
+      sessionId: existingSessionId,
+      workingDirectory: this.workingDirectory,
+      channelId,
+      mcpPort: terminal.mcpPort,
+    });
+
+    console.log(`[/context] Sending via ${strategy.type}${existingSessionId ? ` --resume "${existingSessionId.substring(0, 8)}..."` : ''}`);
+
     this.busyChannels.add(channelId);
 
     return new Promise((resolve, reject) => {
@@ -526,14 +588,17 @@ export class TerminalManager {
           this.busyChannels.delete(channelId);
           reject(new Error('Timeout waiting for response'));
         }
-      }, 60000); // 1 minute timeout
+      }, 60000);
 
       const tryParseResult = () => {
-        // Find the result JSON object - it starts with {"type":"result" and ends with }
+        // Try strategy-specific parsing first
+        const usage = strategy.parseUsageStats(output);
+        if (usage) return { type: 'result', usage };
+
+        // Fallback: look for {"type":"result"...} JSON
         const startIdx = output.indexOf('{"type":"result"');
         if (startIdx === -1) return null;
 
-        // Find the matching closing brace by counting braces
         let braceCount = 0;
         let endIdx = -1;
         for (let i = startIdx; i < output.length; i++) {
@@ -548,11 +613,8 @@ export class TerminalManager {
         if (endIdx === -1) return null;
 
         try {
-          const jsonStr = output.substring(startIdx, endIdx);
-          const result = JSON.parse(jsonStr);
-          return result;
-        } catch (e) {
-          // Not valid JSON yet
+          return JSON.parse(output.substring(startIdx, endIdx));
+        } catch {
           return null;
         }
       };
@@ -560,10 +622,17 @@ export class TerminalManager {
       const dataHandler = (data: string) => {
         output += data;
 
-        // Check for completion marker
-        if (output.includes('___CLAUDE_DONE___') && !sawDoneMarker) {
-          sawDoneMarker = true;
-          // Wait a bit for all output to arrive, then parse
+        // Check for done marker using strategy
+        const cleanData = stripAnsi ? stripAnsi(data) : data;
+        const lines = cleanData.split('\n');
+        for (const line of lines) {
+          if (strategy.isDoneMarker(line) && !sawDoneMarker) {
+            sawDoneMarker = true;
+            break;
+          }
+        }
+
+        if (sawDoneMarker && !resolved) {
           setTimeout(() => {
             if (!resolved) {
               const result = tryParseResult();
@@ -572,30 +641,14 @@ export class TerminalManager {
                 clearTimeout(timeout);
                 this.busyChannels.delete(channelId);
                 resolve(result);
-              } else {
-                // Keep waiting for more data, will be handled by subsequent data events
               }
             }
           }, 500);
         }
-
-        // Also try to parse on each data event after done marker (in case JSON comes in chunks)
-        if (sawDoneMarker && !resolved) {
-          const result = tryParseResult();
-          if (result) {
-            resolved = true;
-            clearTimeout(timeout);
-            this.busyChannels.delete(channelId);
-            resolve(result);
-          }
-        }
       };
 
-      // Listen for data
       terminal.pty.onData(dataHandler);
-
-      // Send the command
-      terminal.pty.write(claudeCmd + '\r');
+      terminal.pty.write(cmd + '\r');
       terminal.lastActivity = new Date();
     });
   }

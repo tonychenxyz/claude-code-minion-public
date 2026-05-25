@@ -36,6 +36,12 @@ if ! command -v claude &> /dev/null; then
     echo "Install it with: npm install -g @anthropic-ai/claude-code"
 fi
 
+# Check for Codex CLI
+if ! command -v codex &> /dev/null; then
+    echo "Warning: Codex CLI not found"
+    echo "Install Codex and make sure the 'codex' command is on PATH if you want Codex support"
+fi
+
 # Install dependencies
 echo ""
 echo "Installing dependencies..."
@@ -65,7 +71,8 @@ if [ ! -f "../.env" ]; then
     echo "Please edit .env (in root directory) and add your tokens:"
     echo "  - SLACK_BOT_TOKEN (starts with xoxb-)"
     echo "  - SLACK_APP_TOKEN (starts with xapp-)"
-    echo "  - CLAUDE_CODE_OAUTH_TOKEN (from 'claude setup-token')"
+    echo "  - CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY for Claude Code"
+    echo "  - OPENAI_API_KEY or codex login auth for Codex"
     echo ""
     echo "Get Slack tokens from your Slack App settings:"
     echo "  https://api.slack.com/apps"

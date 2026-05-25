@@ -32,6 +32,10 @@ features:
       description: Show terminal output for debugging
       usage_hint: /debug
       should_escape: false
+    - command: /agent
+      description: Switch agent (claude/codex) or show current
+      usage_hint: /agent [claude|codex]
+      should_escape: false
 
 oauth_config:
   scopes:

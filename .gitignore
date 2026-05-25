@@ -4,4 +4,7 @@ dist/
 .minion-sessions.json
 .minion-channel-sessions.json
 .claude-minion/
+.codex/*
+!.codex/AGENTS.md
+!.codex/skills
 *.log

@@ -1,189 +1,117 @@
 # Claude Code Minion
 
-Talk to Claude Code running on a remote server through Slack. The server initiates all connections (Socket Mode), so no incoming ports need to be exposed.
+Run Claude Code or Codex on a remote server and talk to the active agent from Slack. The bot uses Slack Socket Mode, so the server only needs outbound network access.
 
-## Architecture
+## 1. What Can You Do
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                           Remote Server                               │
-│                                                                       │
-│  ┌─────────────────────┐      ┌────────────────────────────────────┐ │
-│  │   Main Orchestrator │      │  Claude Code + MCP (Channel #1)    │ │
-│  │   (Slack Socket     │◄────►│  - PTY terminal                    │ │
-│  │    Mode Bot)        │      │  - slack-messenger MCP             │ │
-│  │                     │      └────────────────────────────────────┘ │
-│  │  - Session tokens   │      ┌────────────────────────────────────┐ │
-│  │  - Channel mapping  │◄────►│  Claude Code + MCP (Channel #2)    │ │
-│  │  - Message routing  │      └────────────────────────────────────┘ │
-│  └──────────┬──────────┘                                             │
-│             │ WebSocket (server-initiated)                           │
-└─────────────┼────────────────────────────────────────────────────────┘
-              ▼
-       [ Slack API ]
-```
+Claude Code Minion lets you run Claude Code or Codex on a remote machine and chat with it from Slack.
 
-## Features
+You can use it like a normal Slack teammate: ask it to inspect files, edit code, run commands, debug failures, and report back in the channel. You can switch between Claude Code and Codex, interrupt the current run, or start a fresh session at any time.
 
-- **Socket Mode**: Server initiates WebSocket connection to Slack (no exposed ports)
-- **Multi-channel**: Each Slack channel gets its own Claude Code instance
-- **MCP Integration**: Claude Code communicates back via MCP tools
-- **Session Tokens**: Secure pairing between Slack users and server sessions
+## 2. Quick Start
 
-## Quick Start
+### Create The Slack App
 
-### 1. Create Slack App
+1. Go to <https://api.slack.com/apps>.
+2. Create a new app from a manifest.
+3. Paste `app/slack-app-manifest.yaml`.
+4. Install the app to your workspace.
+5. Copy the bot token (`xoxb-...`) from **OAuth & Permissions**.
+6. Create an app-level token with `connections:write` from **Basic Information > App-Level Tokens** and copy the `xapp-...` token.
 
-1. Go to [Slack API](https://api.slack.com/apps)
-2. Click "Create New App" → "From an app manifest"
-3. Select your workspace
-4. Paste the contents of `app/slack-app-manifest.yaml`
-5. Click "Create"
+If you are updating an existing Slack app, re-apply the manifest so Slack registers all slash commands, including `/agent`.
 
-### 2. Get Slack Tokens
+### Install Agent CLIs
 
-After creating the app:
-
-1. Go to **OAuth & Permissions** → Install to Workspace
-2. Copy the **Bot User OAuth Token** (starts with `xoxb-`)
-
-3. Go to **Basic Information** → App-Level Tokens
-4. Click "Generate Token and Scopes"
-5. Name: `socket-mode`, Scope: `connections:write`
-6. Copy the **App Token** (starts with `xapp-`)
-
-### 3. Setup Claude Code Authentication
-
-**Option A: Claude Max Subscription (Recommended)**
+Install and authenticate whichever agents you want to use:
 
 ```bash
-claude setup-token
-# Copy the token (sk-ant-oat01-...)
+# Claude Code must be available as `claude`
+claude --version
+
+# Codex must be available as `codex`
+codex --version
 ```
 
-**Option B: Anthropic API Key**
+Claude Code can use `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Codex can use `OPENAI_API_KEY` or an existing `codex login` auth file.
+
+### Configure And Start
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-your-api-key"
-```
-
-### 4. Configure Environment
-
-```bash
-cd claude-code-minion/app
+cd /path/to/claude_code_minion_release
+cd app
 ./setup.sh
-
-# Edit .env in root directory
-nano ../.env
+cd ..
+cp .env.example .env 2>/dev/null || touch .env
 ```
 
-Add to `.env`:
-```env
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-SLACK_APP_TOKEN=xapp-your-app-token
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-your-token
-```
-
-### 5. Start the Bot
+Edit `.env` with your Slack tokens and at least one agent credential, then start:
 
 ```bash
 ./start.sh
 ```
 
-This uses pm2 for auto-restart and will:
-- Install pm2 if needed
-- Start the bot with auto-restart on crash
-- DM you the session token on (re)starts
+The bot prints a session token and also DMs the token to the last connected user on restart. DM that token to the bot, invite the bot to a channel, then send a normal message.
 
-### 6. Connect via Slack
-
-1. Copy the **Session Token** shown when the bot starts (or check your DMs)
-2. DM the bot in Slack with the token
-3. Create a new channel and invite the bot
-4. Start chatting!
-
-## Managing the Bot
+Useful process commands:
 
 ```bash
-# View logs
 pm2 logs claude-minion
-
-# Check status
 pm2 status
-
-# Restart
 pm2 restart claude-minion
-
-# Stop
-pm2 stop claude-minion
-# or
 ./stop.sh
 ```
 
-### If port 3000 is stuck
+## 3. Configuration
 
-```bash
-lsof -i :3000
-kill -9 <PID>
-pm2 restart claude-minion
-```
-
-## Configuration
-
-Full `.env` options:
+Required Slack settings:
 
 ```env
-# Required
 SLACK_BOT_TOKEN=xoxb-your-bot-token
 SLACK_APP_TOKEN=xapp-your-app-token
-CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-your-token
+```
 
-# Optional
-ORCHESTRATOR_PORT=3000
-WORKING_DIRECTORY=/path/to/your/projects
+Claude Code settings:
+
+```env
+CLAUDE_CODE_OAUTH_TOKEN=your-claude-code-oauth-token
+# or
+ANTHROPIC_API_KEY=your-anthropic-api-key
 CLAUDE_MODEL=claude-sonnet-4-5-20250929
-
-# Multiple tokens (for switching accounts)
-# CLAUDE_CODE_OAUTH_TOKEN_work=sk-ant-oat01-work-token
-# CLAUDE_CODE_OAUTH_TOKEN_personal=sk-ant-oat01-personal-token
 ```
 
-## Commands
+Codex settings:
 
-### Slash Commands
-| Command | Description |
-|---------|-------------|
-| `/reset` | Start a new conversation |
-| `/interrupt` | Interrupt Claude (Ctrl+C) |
-| `/compact` | Compact conversation context |
-
-### Text Commands (in channels)
-| Command | Description |
-|---------|-------------|
-| `!interrupt` / `!stop` | Interrupt Claude |
-| `!reset` / `!new` | New conversation |
-| `!debug` | Show terminal output |
-
-### DM Commands
-| Command | Description |
-|---------|-------------|
-| `<token>` | Connect with session token |
-| `tokens` | List available OAuth tokens |
-| `use <alias>` | Switch token |
-
-## Troubleshooting
-
-### Bot not responding
-- Check Slack tokens in `.env`
-- Ensure bot is invited to the channel
-- Check logs: `pm2 logs claude-minion`
-
-### "Invalid API key" error
-```bash
-claude -p "hi"  # Test authentication
-claude setup-token  # Regenerate if needed
+```env
+OPENAI_API_KEY=your-openai-api-key
+CODEX_MODEL=gpt-5.5
+CODEX_REASONING_EFFORT=xhigh
 ```
 
-## License
+For Codex, the bot keeps a repo-local `.codex/` home and links Codex instructions back to `CLAUDE.md` through `AGENTS.md`.
 
-MIT
+Bot settings:
+
+```env
+ORCHESTRATOR_PORT=3000
+WORKING_DIRECTORY=/path/to/workspace
+DEFAULT_AGENT=claude
+CONTEXT_WINDOW_MAX=200000
+```
+
+`DEFAULT_AGENT` can be `claude` or `codex`. Existing channels keep their persisted agent type. Users can set their default agent by DMing `agent claude` or `agent codex`, and channels can switch with `/agent claude` or `/agent codex`.
+
+## 4. Slash Commands
+
+| Command | Agent Support | Description |
+| --- | --- | --- |
+| `/reset` | Claude Code and Codex | Start a fresh conversation for the current channel agent. |
+| `/interrupt` | Claude Code and Codex | Send Ctrl+C to the current channel agent and clear stale queued work. |
+| `/compact` | Claude Code only | Ask Claude Code to compact the current conversation context. |
+| `/agent` | Bot control | Show the current channel agent and default agent. |
+| `/agent claude` | Bot control | Switch the channel to Claude Code. |
+| `/agent codex` | Bot control | Switch the channel to Codex. |
+| `/context` | Diagnostics | Show the latest recorded usage stats for the channel. |
+| `/debug` | Diagnostics | Show recent terminal output, visible only to the requester. |
+
+Only `/reset` and `/interrupt` are shared model-control commands for both Claude Code and Codex. `/compact` is Claude Code only.

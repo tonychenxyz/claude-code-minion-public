@@ -52,7 +52,19 @@ The working directory is set via the `WORKING_DIRECTORY` environment variable in
 
 You have access to MCP tools from the `slack-messenger` server:
 
-### Av<your-partition>le Tools
+### Codex Slack Bridge
+
+Codex `exec` sessions may not expose local MCP tools as callable functions even when `codex mcp list` shows `slack-messenger`. In Codex mode, do not use `tool_search`, `tool_suggest`, or the public Slack connector to communicate with the user. Use the local bridge script with Bash instead:
+
+```bash
+node scripts/slack-message.js regular "status update"
+node scripts/slack-message.js mention "done or need input"
+node scripts/slack-message.js upload "/absolute/path/to/file"
+```
+
+The bridge reads `CHANNEL_ID` and `ORCHESTRATOR_URL` from the minion terminal environment and posts through the local orchestrator.
+
+### Available Tools
 
 1. **`send_regular_message`** - Send a message WITHOUT @mentioning the user
    - Use this FREQUENTLY to log everything you're doing
@@ -842,76 +854,6 @@ Send: "✅ Command finished - [summary of result]"
 - User sees real-time progress instead of silence
 - Each check is explicit - you decide when to check next
 - You can adjust sleep interval based on expected duration
-
-### Live Terminal Output with Seashells (seashells.io)
-
-**For long-running jobs, use seashells.io to give the user a live terminal view!**
-
-Seashells pipes terminal output to a web URL in real-time. The user can watch the full output live instead of waiting for your periodic summaries.
-
-**When to use seashells:**
-- Long-running training jobs (> 5 minutes)
-- SLURM jobs with lots of output
-- Any command where the user might want to see the full live output
-- When periodic summaries aren't enough detail
-
-**How to use (with tee for local logging and proper buffering):**
-```bash
-# RECOMMENDED: Use stdbuf for line buffering + tee + seashells
-stdbuf -oL command 2>&1 | tee /tmp/output.log | seashells &
-
-# For Python specifically, add -u for unbuffered output:
-stdbuf -oL python -u script.py 2>&1 | tee /tmp/output.log | seashells &
-
-# Example with SLURM:
-stdbuf -oL srun python -u train.py 2>&1 | tee /tmp/train.log | seashells &
-
-# Example with npm build:
-stdbuf -oL npm run build 2>&1 | tee /tmp/build.log | seashells &
-```
-
-**CRITICAL: Buffering issues and solutions:**
-- Without `stdbuf -oL`: Output may be buffered and appear delayed or duplicated
-- `stdbuf -oL` forces line buffering so output appears in real-time
-- For Python: Also use `-u` flag (unbuffered stdout/stderr)
-- `unbuffer` is NOT av<your-partition>le on this system - use `stdbuf` instead
-
-**IMPORTANT: Always use `tee` to save output locally!**
-- Without `tee`: Output only goes to seashells → you can't debug
-- With `tee`: Output goes to BOTH seashells AND a local log file
-- This lets you `tail /tmp/output.log` to check progress and debug errors
-
-**Workflow:**
-1. Run command with `stdbuf -oL ... 2>&1 | tee /tmp/output.log | seashells &` suffix
-2. Wait a few seconds, then check log for the seashells URL
-3. The URL appears as: `serving at https://seashells.io/v/abc123`
-4. Send the URL to user: "🔗 Live terminal: https://seashells.io/v/abc123"
-5. Continue with regular monitoring using `tail /tmp/output.log`
-
-**Example:**
-```
-1. Run: `stdbuf -oL .venv/bin/python -u train.py 2>&1 | tee /tmp/train.log | seashells &`
-2. Run: `sleep 5 && head -30 /tmp/train.log` to see seashells URL
-3. URL found: "serving at https://seashells.io/v/xyz789"
-4. Send: "🔧 Running: `python train.py`"
-5. Send: "🔗 *Live terminal output:* https://seashells.io/v/xyz789"
-6. [Monitor with `tail -20 /tmp/train.log` as usual]
-```
-
-**Gotchas:**
-- The seashells URL may appear AFTER some initial output (not always first line)
-- Output may appear duplicated in the log due to buffering timing - this is cosmetic
-- If `unbuffer` is needed but not av<your-partition>le, `stdbuf -oL` is the alternative
-
-**Limitations:**
-- Sessions expire after ~1 day
-- Max 5 concurrent sessions per IP
-- Service is in beta (not for mission-critical monitoring)
-
-**Installation (already done):**
-```bash
-pip install seashells
-```
 
 ## File Attachments
 
